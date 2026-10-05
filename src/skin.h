@@ -56,6 +56,7 @@ struct View {
     std::vector<std::pair<HWND,bool>> children;
     POINT drag_start{};
     int pressed{}, scroll{}, selected{-1}, wheel{}, grab{}, seek{-1}, initial{};
+    int track_value{}, track_coordinate{};
     bool hot{true}, row_drag{}, selection_pending{};
     int drop{-1}, external_drop{-1};
     bool shaded{}, dragging{}, resizing{}, host_drag{};
@@ -145,7 +146,7 @@ private:
     void VideoContentChanged();
     int Hit(const View& view,POINT point,RECT* bounds=nullptr) const;
     void Activate(View& view,int hit,POINT point);
-    void Track(View& view,int hit,POINT point);
+    void Track(View& view,int hit,POINT point,bool final=false);
     void ToggleShade(View& view);
     void Region(View& view);
     void HideChildren(View& view);

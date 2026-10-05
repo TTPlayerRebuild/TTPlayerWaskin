@@ -80,6 +80,7 @@ struct Modern::Impl {
  HWND window{},tooltip{};std::wstring tipText;Node *hover{},*pressed{};POINT down{};
  bool ready{},completed{},fault{},moving{},hostMoving{},rowDragging{},selectionPending{},volumeGesture{};RECT saved{},restored{},playlistRect{},dragOrigin{};POINT dragAnchor{};HRGN savedRegion{};
  int revealRow{-1},wheel{};bool playlistFocus{};
+ int sliderQueued{},sliderInitial{},sliderGrab{},sliderCoordinate{};bool profileSliding{};
  PlaylistFontCache playlistFont;std::unique_ptr<Gdiplus::Font> rowFont;int rowHeight{14};LOGFONTW defaultPlaylistFont{};
  std::vector<std::pair<HWND,bool>> children;std::unique_ptr<Gdiplus::Bitmap> frame;
  bool restoreLeft{},restoreRight{},restoreVis{};
@@ -366,10 +367,16 @@ struct Modern::Impl {
             {L"prev",TTP_SKIN_PREVIOUS},{L"next",TTP_SKIN_NEXT},{L"close",TTP_SKIN_CLOSE},{L"minimize",TTP_SKIN_MINIMIZE},{L"sysmenu",TTP_SKIN_MENU},{L"eject",TTP_SKIN_OPEN}};
         if(!action.empty()){const auto i=std::find_if(std::begin(actions),std::end(actions),[&](const auto& a){return action==a.first;});Require(i!=std::end(actions),"unsupported XML action");Command(i->second);}}
     void Click(const wchar_t* id){Click(root->Find(id));Flush();}
-    void Slider(Node* n,int value,bool final){if(n->unsupported || n->disabledAction)return;auto action=Lower(n->attrs[L"action"]);
+    void Slider(Node* n,int value,bool final,bool physical=false){if(n->unsupported || n->disabledAction)return;auto action=Lower(n->attrs[L"action"]);
+        const auto notify=[&](uint32_t command,int mapped) {
+            // Do not use host State() to deduplicate posted commands: a burst
+            // of mouse moves may arrive before the host dispatches any of them.
+            if(!physical || final || mapped!=sliderQueued)Command(command,mapped);
+            if(physical)sliderQueued=mapped;
+        };
         if(action==L"volume"){n->position=std::clamp(value,0,255);Command(TTP_SKIN_VOLUME,MulDiv(n->position,100,255));}
-        else if(action==L"pan"){n->position=std::clamp(value,0,255);Command(TTP_SKIN_BALANCE,std::clamp(MulDiv(n->position-127,100,127),-100,100));}
-        else if(action==L"eq_band" || action==L"eq_preamp"){n->position=std::clamp(value,-127,127);Command(TTP_SKIN_EQ_VALUE+EqIndex(n),MulDiv(n->position,12,127));}
+        else if(action==L"pan"){n->position=std::clamp(value,0,255);notify(TTP_SKIN_BALANCE,std::clamp(MulDiv(n->position-127,100,127),-100,100));}
+        else if(action==L"eq_band" || action==L"eq_preamp"){if(!State().eq_enabled)return;n->position=std::clamp(value,-127,127);notify(TTP_SKIN_EQ_VALUE+EqIndex(n),MulDiv(n->position,12,127));}
         else if(action==L"seek"){n->position=std::clamp(value,0,65535);if(final)Command(TTP_SKIN_SEEK,MulDiv(n->position,10000,65535));}
         else if(action.empty())n->position=std::clamp(value,n->Get(L"low",0),std::max(n->Get(L"low",0),n->Get(L"high",255)));
         else throw std::runtime_error("unsupported slider action");
@@ -618,15 +625,31 @@ struct Modern::Impl {
    if(tooltip){TOOLINFOW info{sizeof(info)};info.uFlags=TTF_IDISHWND|TTF_SUBCLASS;info.hwnd=window;info.uId=reinterpret_cast<UINT_PTR>(window);info.lpszText=tipText.data();SendMessageW(tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&info));SendMessageW(tooltip,TTM_SETMAXTIPWIDTH,0,600);}}
   if(tooltip){SendMessageW(tooltip,TTM_POP,0,0);TOOLINFOW info{sizeof(info)};info.hwnd=window;info.uId=reinterpret_cast<UINT_PTR>(window);info.lpszText=tipText.data();SendMessageW(tooltip,TTM_UPDATETIPTEXTW,0,reinterpret_cast<LPARAM>(&info));}
  }
- void Slide(Node* n,POINT p,bool final){
+ void Slide(Node* n,POINT p,bool final,bool begin=false){
   const auto hit=std::find_if(hits.begin(),hits.end(),[&](const auto& h){return h.node==n;});if(hit==hits.end())return;
   auto* thumb=Bitmap(n->attrs[L"thumb"]);auto r=hit->bounds;const bool vertical=Vertical(n);
-  // Position thumb center under the pointer; reach both endpoints exactly.
+  // Preserve the grab offset for EQ/pan thumbs. A press without movement must
+  // not notify the preset state machine; release sends its final notification.
   const int thumbSize=int(vertical?thumb->GetHeight():thumb->GetWidth());
   const int extent=std::max(1,int(vertical?r.bottom-r.top:r.right-r.left)-thumbSize);
-  double fraction=double((vertical?p.y-r.top:p.x-r.left)-thumbSize/2)/extent;if(vertical)fraction=1-fraction;
-  fraction=std::clamp(fraction,0.0,1.0);auto action=Lower(n->attrs[L"action"]);
-  Slider(n,action==L"seek"?int(fraction*65535):action.starts_with(L"eq_")?int(fraction*254)-127:action.empty()?n->Get(L"low")+int(fraction*(n->Get(L"high",255)-n->Get(L"low"))):int(fraction*255),final);
+  const auto action=Lower(n->attrs[L"action"]);const bool eq=action==L"eq_band" || action==L"eq_preamp",profile=eq || action==L"pan";
+  const int coordinate=vertical?p.y-r.top:p.x-r.left;
+  if(begin && profile) {
+   profileSliding=true;
+   const auto state=State();sliderInitial=sliderQueued=eq?state.eq[EqIndex(n)]:state.balance;
+   n->position=eq?MulDiv(sliderInitial,127,12):std::clamp(MulDiv(sliderInitial,127,100)+127,0,255);
+   const double fraction=eq?double(n->position+127)/254:double(n->position)/255;
+   const int offset=int((vertical?1-fraction:fraction)*extent);
+   const bool onThumb=coordinate>=offset && coordinate<offset+thumbSize;
+   sliderGrab=onThumb?coordinate-offset:thumbSize/2;sliderCoordinate=coordinate;
+   if(onThumb)return;
+   sliderCoordinate=INT_MIN;
+  }
+  if(profile && coordinate==sliderCoordinate) {Slider(n,n->position,final,true);return;}
+  double fraction=double(coordinate-(profile?sliderGrab:thumbSize/2))/extent;if(vertical)fraction=1-fraction;
+  fraction=std::clamp(fraction,0.0,1.0);
+  Slider(n,action==L"seek"?int(fraction*65535):eq?int(std::lround(fraction*254))-127:action.empty()?n->Get(L"low")+int(fraction*(n->Get(L"high",255)-n->Get(L"low"))):int(fraction*255),final,true);
+  if(profile)sliderCoordinate=coordinate;
  }
  LRESULT Message(UINT message,WPARAM wp,LPARAM lp){
   if(ready && SyncPlaylistFont()){Render();InvalidateRect(window,nullptr,FALSE);}
@@ -642,7 +665,7 @@ struct Modern::Impl {
   case WM_PRINTCLIENT:Draw(reinterpret_cast<HDC>(wp));return 0;
   case WM_TIMER:if(wp==modernTimer){if(!fault){Advance(GetTickCount());Render();SyncContent();Region();InvalidateRect(window,nullptr,FALSE);}return 0;}break;
   case WM_LBUTTONDOWN:
-   SetFocus(window);pressed=HitTest(p);down=p;rowDragging=false;selectionPending=false;
+   SetFocus(window);pressed=HitTest(p);down=p;rowDragging=false;selectionPending=false;profileSliding=false;
    volumeGesture=pressed && Lower(pressed->attrs[L"action"])==L"volume";
    if(pressed && MouseEvent(pressed,L"onLeftButtonDown",p)){if(GetCapture()!=window)SetCapture(window);InvalidateRect(window,nullptr,FALSE);return 0;}
    if((!pressed || (!IsButton(pressed) && pressed->kind!=L"slider" && pressed->attrs[L"param"]!=L"guid:pl" && pressed->Get(L"move",1))) && layout->Get(L"move",1)) {
@@ -652,7 +675,7 @@ struct Modern::Impl {
    if(pressed && pressed->attrs[L"param"]==L"guid:pl"){int row=Row(p);
     selectionPending=row>=0 && host.selection && (host.selection(host.context,row)&1) && !(wp&(MK_CONTROL|MK_SHIFT));
     if(!selectionPending)Select(row,wp);}
-   else if(pressed && pressed->kind==L"slider")Slide(pressed,p,false);
+   else if(pressed && pressed->kind==L"slider")Slide(pressed,p,false,true);
    else if(IsButton(pressed)){}
    InvalidateRect(window,nullptr,FALSE);return 0;
   case WM_MOUSEMOVE:
@@ -681,13 +704,20 @@ struct Modern::Impl {
   case WM_MOUSEWHEEL:ScreenToClient(window,&p);if(PlaylistHit(p)){PlaylistWheel(wp,wheel,scroll,int(State().track_count),PlaylistPage(playlistRect,rowHeight));InvalidateRect(window,nullptr,FALSE);}
    else VolumeWheel(host,GET_WHEEL_DELTA_WPARAM(wp),State().volume);return 0;
   case WM_KEYDOWN:
+   if(wp==VK_ESCAPE && profileSliding && pressed && pressed->kind==L"slider") {
+    const auto action=Lower(pressed->attrs[L"action"]);
+    if(action==L"pan")Command(TTP_SKIN_BALANCE,sliderInitial);
+    else if(action==L"eq_band" || action==L"eq_preamp")Command(TTP_SKIN_EQ_VALUE+EqIndex(pressed),sliderInitial);
+    else break;
+    SendMessageW(window,WM_CANCELMODE,0,0);return 0;
+   }
    if(wp==VK_DELETE && selected>=0){Command(TTP_SKIN_DELETE_SELECTED);return 0;}
    if(wp==VK_RETURN && selected>=0){Command(TTP_SKIN_PLAY_ROW,selected);return 0;}
    if(wp=='A' && (GetKeyState(VK_CONTROL)&0x8000)){Command(TTP_SKIN_SELECT_ALL);return 0;}
    break;
   case WM_CAPTURECHANGED:case WM_CANCELMODE:
    if(std::exchange(volumeGesture,false) && ready)EndVolume(host);
-   pressed=nullptr;rowDragging=selectionPending=false;EndMove();if(message==WM_CANCELMODE && GetCapture()==window)ReleaseCapture();return 0;
+   pressed=nullptr;rowDragging=selectionPending=profileSliding=false;EndMove();if(message==WM_CANCELMODE && GetCapture()==window)ReleaseCapture();return 0;
   case WM_SETCURSOR:if(LOWORD(lp)==HTCLIENT){SetCursor(LoadCursorW(nullptr,IDC_ARROW));return TRUE;}break;
   case WM_GETMINMAXINFO:{auto* info=reinterpret_cast<MINMAXINFO*>(lp);info->ptMinTrackSize=info->ptMaxTrackSize={layout->Get(L"w"),layout->Get(L"h")};return 0;}
   }

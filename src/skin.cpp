@@ -868,25 +868,38 @@ void Skin::BeginTrack(View& v,int hit,POINT p) {
     else if(hit==hitScroll) {RECT r{};GetClientRect(v.window,&r);start=20;travel=std::max(1,int(r.bottom)-76);thumb=18;coordinate=p.y;
         const int maximum=std::max(0,int(s.track_count)-std::max(1,(int(r.bottom)-60)/row_height_));position=maximum?v.scroll*travel/maximum:0;}
     else {v.initial=s.eq[hit-TTP_SKIN_EQ_VALUE];start=38;travel=51;thumb=11;coordinate=p.y;position=(12-std::clamp(v.initial,-12,12))*travel/24;}
-    v.grab=coordinate>=start+position && coordinate<start+position+thumb?coordinate-start-position:thumb/2;
+    const bool onThumb=coordinate>=start+position && coordinate<start+position+thumb;
+    v.grab=onThumb?coordinate-start-position:thumb/2;
+    v.track_value=v.initial;v.track_coordinate=coordinate;
+    // Pressing the thumb is not an EQ change. Keep a local queued value because
+    // host commands are asynchronous and State() may still report the old one.
+    if(hit==hitBalance || (hit>=TTP_SKIN_EQ_VALUE && hit<TTP_SKIN_EQ_VALUE+11)) {
+        if(onThumb)return;
+        v.track_coordinate=INT_MIN;
+    }
     Track(v,hit,p);
 }
-void Skin::Track(View& v,int hit,POINT p) {
+void Skin::Track(View& v,int hit,POINT p,bool final) {
     if(hit==hitVolume) {
         const int value=std::clamp((int(p.x)-(v.shaded?61:107)-v.grab)*100/(v.shaded?94:51),0,100);
         Command(TTP_SKIN_VOLUME,value);
         if(!NativeVolume(host_))Feedback(L"Volume: "+std::to_wstring(value)+L"%");
     } else if(hit==hitBalance) {
         int value=std::clamp((int(p.x)-(v.shaded?164:177)-v.grab)*200/(v.shaded?39:24)-100,-100,100);
-        if(std::abs(value)<10) value=0;Command(TTP_SKIN_BALANCE,value);Feedback(L"Balance: "+std::to_wstring(value));
+        if(std::abs(value)<10) value=0;
+        if(p.x==v.track_coordinate)value=v.track_value;
+        if(final || value!=v.track_value)Command(TTP_SKIN_BALANCE,value);
+        v.track_value=value;v.track_coordinate=p.x;Feedback(L"Balance: "+std::to_wstring(value));
     } else if(hit==hitSeek) {
         if(State().duration_ms<=0) return;
         v.seek=std::clamp((int(p.x)-(v.shaded?227:16)-v.grab)*10000/(v.shaded?12:219),0,10000);
         Feedback(L"Seek: "+Time(State().duration_ms*v.seek/10000));
     } else if(hit>=TTP_SKIN_EQ_VALUE && hit<TTP_SKIN_EQ_VALUE+11) {
         if(!State().eq_enabled) return;
-        const int value=std::clamp(12-(int(p.y)-38-v.grab)*24/51,-12,12);
-        Command(uint32_t(hit),value);Feedback((hit==TTP_SKIN_EQ_VALUE?L"Preamp: ":L"EQ: ")+std::to_wstring(value)+L" dB");
+        const int value=p.y==v.track_coordinate?v.track_value:std::clamp(12-MulDiv(int(p.y)-38-v.grab,24,51),-12,12);
+        if(final || value!=v.track_value)Command(uint32_t(hit),value);
+        v.track_value=value;v.track_coordinate=p.y;
+        Feedback((hit==TTP_SKIN_EQ_VALUE?L"Preamp: ":L"EQ: ")+std::to_wstring(value)+L" dB");
     } else if(hit==hitScroll) {
         RECT r{};GetClientRect(v.window,&r);const auto s=State();
         const int maximum=std::max(0,int(s.track_count)-std::max(1,(int(r.bottom)-60)/row_height_));
@@ -1122,7 +1135,7 @@ LRESULT Skin::Message(View& v,UINT message,WPARAM wp,LPARAM lp) {
             v.pressed=0;v.row_drag=false;v.selection_pending=false;v.drop=-1;
             if(GetCapture()==v.window) ReleaseCapture();InvalidateRect(v.window,nullptr,FALSE);return 0;
         }
-        if(GetCapture()==v.window && Sliding(hit)) {Track(v,hit,point);if(hit==hitSeek && v.seek>=0) Command(TTP_SKIN_SEEK,v.seek);}
+        if(GetCapture()==v.window && Sliding(hit)) {Track(v,hit,point,true);if(hit==hitSeek && v.seek>=0) Command(TTP_SKIN_SEEK,v.seek);}
         const bool resize=v.resizing && !v.host_drag;
         v.pressed=0;v.seek=-1;
         if(hit==hitVolume)EndVolume(host_);
