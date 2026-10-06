@@ -28,7 +28,7 @@ jobs:
       run:
         shell: pwsh
     outputs:
-      version: ${{ steps.version.outputs.value }}
+      version: ${{ steps.version.outputs.version }}
       previous: ${{ steps.version.outputs.previous }}
       dll_sha256: ${{ steps.package.outputs.dll_sha256 }}
     steps:
@@ -37,50 +37,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Determine version (Beijing date)
+      - name: Allocate Beijing date version before compilation
         id: version
         env:
           GH_TOKEN: ${{ github.token }}
-          PUBLISH_RELEASE: ${{ inputs.release_a_version }}
+          RELEASE_REQUESTED: ${{ inputs.release_a_version }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          function Read-VersionTag([string]$name) {
-            $match = [regex]::Match($name, '^(?<date>[0-9]{4}\.[0-9]{2}\.[0-9]{2})(?:p(?<patch>[1-9][0-9]*))?$')
-            if (-not $match.Success) { return }
-            $date = [datetime]::MinValue
-            if (-not [datetime]::TryParseExact($match.Groups['date'].Value, 'yyyy.MM.dd',
-                [Globalization.CultureInfo]::InvariantCulture,
-                [Globalization.DateTimeStyles]::None, [ref]$date)) { return }
-            $patch = 0L
-            if ($match.Groups['patch'].Success -and -not [long]::TryParse($match.Groups['patch'].Value, [ref]$patch)) {
-              throw 'Version patch number is too large.'
-            }
-            [pscustomobject]@{ Name = $name; Date = $date; Patch = $patch }
-          }
-          # Match TTPlayerRebuild: yyyy.MM.dd, then p1, p2, ... on the same day.
-          $releaseDate = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(8)).ToString(
-            'yyyy.MM.dd', [Globalization.CultureInfo]::InvariantCulture)
-          $base = Read-VersionTag $releaseDate
-          $version = $base.Name
-          $previous = $null
-          if ($env:PUBLISH_RELEASE -eq 'true') {
-            $tags = @(gh api "repos/$env:GITHUB_REPOSITORY/tags?per_page=100" --paginate --jq '.[].name')
-            if ($LASTEXITCODE -ne 0) { throw 'Could not read repository tags.' }
-            # A failed upload can leave a draft with no tag; reserve its name too.
-            $releaseTags = @(gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[].tag_name')
-            if ($LASTEXITCODE -ne 0) { throw 'Could not read existing releases.' }
-            $versions = @($tags | ForEach-Object { Read-VersionTag $_ })
-            $occupied = @($versions) + @($releaseTags | ForEach-Object { Read-VersionTag $_ })
-            $sameDay = @($occupied | Where-Object { $_.Date -eq $base.Date } | Sort-Object Patch -Descending)
-            if ($sameDay.Count) {
-              if ($sameDay[0].Patch -eq [long]::MaxValue) { throw 'Version patch number is exhausted.' }
-              $version += 'p' + ($sameDay[0].Patch + 1).ToString([Globalization.CultureInfo]::InvariantCulture)
-            }
-            $previous = $versions | Sort-Object Date, Patch -Descending | Select-Object -First 1
-          }
-          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "previous=$($previous.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Output "Package version: $version"
+          ./cmake/resolve_release_version.ps1 -Repository $env:GITHUB_REPOSITORY `
+            -ReleaseRequested:($env:RELEASE_REQUESTED -eq 'true')
 
       - name: Verify VS 2026 toolchain
         run: |
@@ -102,18 +66,25 @@ jobs:
       # Only this repository is needed. One Release DLL serves both host editions.
       # No local tests, player sources, runtime files or private skins are checked out.
       - name: Configure
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
         run: >-
           cmake -S . -B build -G "Visual Studio 18 2026" -A Win32
           "-DCMAKE_GENERATOR_INSTANCE=$env:WASKIN_VS_INSTANCE"
+          "-DTTP_WASKIN_BUILD_VERSION=$env:PACKAGE_VERSION"
 
       - name: Build and audit XP and Windows 7 imports
         run: cmake --build build --config Release --target ttp_waskin --parallel 4
 
       - name: Prepare package
         id: package
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
+          . ./cmake/version.ps1
           $dll = 'build/Release/ttp_waskin.dll'
+          Assert-WaskinFileVersion $dll $env:PACKAGE_VERSION
           if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) { throw 'The plugin DLL was not produced.' }
           New-Item -ItemType Directory -Path build/package/AddIn | Out-Null
           Copy-Item -LiteralPath $dll -Destination build/package/AddIn/ttp_waskin.dll
@@ -126,7 +97,7 @@ jobs:
       - name: Upload plugin
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ttp_waskin-${{ steps.version.outputs.value }}
+          name: ttp_waskin-${{ steps.version.outputs.version }}
           path: build/package/
           if-no-files-found: error
           retention-days: 14

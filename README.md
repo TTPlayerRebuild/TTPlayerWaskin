@@ -106,3 +106,18 @@ SHA256SUMS.txt
 测试代码位于 `../rebuild/tests/waskin`，不进入此插件的构建目标、分发包或 Actions。
 
 已验证的内容和限制见 [docs/WSZ_IMPLEMENTATION.md](docs/WSZ_IMPLEMENTATION.md)。本工程独立实现兼容逻辑；没有链接 `gen_ff`、Wasabi 或把 Winamp 默认皮肤素材嵌入 DLL。本地对照使用的 Winamp 资源仅保存在忽略的测试输出目录。
+
+## 日期版本与 Release 体积优先构建
+
+DLL 的文件版本和产品版本使用北京时间 `yyyy.MM.dd`，同日发布补丁使用 `pN`；
+例如 `2026.10.06p1` 对应固定数字版本 `2026.10.6.1`。Actions 在编译前确定最终版本，
+DLL、发行包和发布标签使用同一版本。各项目继续独立构建。
+
+Release 的统一配置见 [cmake/size_release.cmake](cmake/size_release.cmake)：
+`/O1 /Os /Gy /Gw /GF`、跨模块优化和链接去除未引用代码／折叠相同代码，关闭 Release 调试信息。
+本项目经 `/Ob0`、`/Ob1`、`/Ob2` 对比，默认选择 `/Ob2`；
+可用 `-DTTP_SIZE_INLINE_LEVEL=0|1|2` 重新测量不同内联策略。
+保留正常浮点语义、异常处理及 VC-LTL／YY-Thunks 的 XP／Win7 兼容配置。
+Actions 不编译、不运行测试；本次新增的测试仅位于本地 `rebuild/tests/dll_size_versions`，不进入发行包。
+
+本地构建、补丁号分配及版本资源说明见 [日期版本构建](docs/BUILD_VERSION.md)。

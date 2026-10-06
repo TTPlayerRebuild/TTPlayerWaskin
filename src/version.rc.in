@@ -1,0 +1,27 @@
+#include <winver.h>
+1 VERSIONINFO
+FILEVERSION @WASKIN_FIXED_VERSION@
+PRODUCTVERSION @WASKIN_FIXED_VERSION@
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Sonic853\0"
+      VALUE "FileDescription", "TTPlayer Winamp skin add-in\0"
+      VALUE "FileVersion", "@WASKIN_BUILD_VERSION@\0"
+      VALUE "InternalName", "ttp_waskin\0"
+      VALUE "OriginalFilename", "ttp_waskin.dll\0"
+      VALUE "ProductName", "TTPlayer Rebuild WASKIN\0"
+      VALUE "ProductVersion", "@WASKIN_BUILD_VERSION@\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
