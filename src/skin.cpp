@@ -1,4 +1,4 @@
-#include "skin.h"
+﻿#include "skin.h"
 #include "host_interaction.h"
 #include "playlist_interaction.h"
 #include "builtin_skin.h"
@@ -601,14 +601,7 @@ void Skin::Region(View& view) {
     if(!region) { RECT r{};GetClientRect(view.window,&r);region=CreateRectRgn(0,0,r.right,r.bottom); }
     if(!SetWindowRgn(view.window,region,TRUE) && region) DeleteObject(region);
 }
-void Skin::HideChildren(View& view) {
-    for(HWND child=GetWindow(view.window,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT)) {
-        if(view.kind==3 && GetPropW(child,TTP_SKIN_CONTENT_CHILD)) continue;
-        if(std::none_of(view.children.begin(),view.children.end(),[child](const auto& p){return p.first==child;}))
-            view.children.emplace_back(child,(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0);
-        if(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE) ShowWindow(child,SW_HIDE);
-    }
-}
+void Skin::HideChildren(View& view) { view.children.Sync(); }
 HRESULT Skin::Attach(const TtpSkinWindows& windows) {
     Detach();binding_=true;scale_=layout_.scale;
     const HWND handles[]={windows.player,windows.playlist,windows.equalizer,
@@ -623,7 +616,7 @@ HRESULT Skin::Attach(const TtpSkinWindows& windows) {
         v.saved_region=CreateRectRgn(0,0,0,0);
         if(GetWindowRgn(v.window,v.saved_region)==ERROR) {DeleteObject(v.saved_region);v.saved_region=nullptr;}
         if(!SetWindowSubclass(v.window,Subclass,subclassId,reinterpret_cast<DWORD_PTR>(&v))) {Detach();binding_=false;return E_FAIL;}
-        HideChildren(v);
+        v.children.Attach(v.window);
         v.expanded_height=layout_.expanded[i];
         const auto& saved=layout_.bounds[i];
         const bool have_saved=saved.right>saved.left && saved.bottom>saved.top;
@@ -703,13 +696,17 @@ void Skin::Detach() noexcept {
             EndDrag(v);
             if(GetCapture()==v.window) ReleaseCapture();
             RemoveWindowSubclass(v.window,Subclass,subclassId);
-            for(const auto& [child,visible]:v.children) if(IsWindow(child) && visible) ShowWindow(child,SW_SHOWNA);
-            SetWindowPos(v.window,nullptr,0,0,v.saved.right-v.saved.left,v.saved.bottom-v.saved.top,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);
-            if(SetWindowRgn(v.window,v.saved_region,TRUE)) v.saved_region=nullptr;
-            InvalidateRect(v.window,nullptr,TRUE);
+            // Restore geometry before publishing the children. The host may
+            // immediately bind a different native skin; synchronous erasing
+            // here would expose its old controls at the provider's positions.
+            SetWindowPos(v.window,nullptr,0,0,v.saved.right-v.saved.left,v.saved.bottom-v.saved.top,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOREDRAW);
+            if(SetWindowRgn(v.window,v.saved_region,FALSE)) v.saved_region=nullptr;
+            v.children.Detach();
+            RedrawWindow(v.window,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
         }
+        v.children.Detach();
         if(v.saved_region) DeleteObject(v.saved_region);
-        v.saved_region=nullptr;v.window=nullptr;v.children.clear();v.pressed=0;v.external_drop=-1;v.dragging=v.resizing=v.host_drag=false;
+        v.saved_region=nullptr;v.window=nullptr;v.pressed=0;v.external_drop=-1;v.dragging=v.resizing=v.host_drag=false;
     }
 }
 void Skin::ToggleShade(View& v) {
@@ -782,6 +779,10 @@ int Skin::Hit(const View& v,POINT p,RECT* bounds) const {
         if(bounds) *bounds={x,y,x+w,y+h};
         return true;
     };
+    if(ResizeEdges(v,p)) {
+        if(bounds) *bounds={p.x,p.y,p.x+1,p.y+1};
+        return hitResize;
+    }
     if(v.kind==3) {
         if(inside(r.right-11,3,9,9)) return TTP_SKIN_LYRICS;
         if(inside(r.right-20,r.bottom-20,20,20)) return hitResize;
@@ -871,6 +872,7 @@ void Skin::BeginTrack(View& v,int hit,POINT p) {
     const bool onThumb=coordinate>=start+position && coordinate<start+position+thumb;
     v.grab=onThumb?coordinate-start-position:thumb/2;
     v.track_value=v.initial;v.track_coordinate=coordinate;
+    if(hit==hitVolume && !onThumb) v.track_coordinate=INT_MIN;
     // Pressing the thumb is not an EQ change. Keep a local queued value because
     // host commands are asynchronous and State() may still report the old one.
     if(hit==hitBalance || (hit>=TTP_SKIN_EQ_VALUE && hit<TTP_SKIN_EQ_VALUE+11)) {
@@ -881,7 +883,9 @@ void Skin::BeginTrack(View& v,int hit,POINT p) {
 }
 void Skin::Track(View& v,int hit,POINT p,bool final) {
     if(hit==hitVolume) {
-        const int value=std::clamp((int(p.x)-(v.shaded?61:107)-v.grab)*100/(v.shaded?94:51),0,100);
+        const int value=p.x==v.track_coordinate?v.track_value:
+            std::clamp((int(p.x)-(v.shaded?61:107)-v.grab)*100/(v.shaded?94:51),0,100);
+        v.track_value=value;v.track_coordinate=p.x;
         Command(TTP_SKIN_VOLUME,value);
         if(!NativeVolume(host_))Feedback(L"Volume: "+std::to_wstring(value)+L"%");
     } else if(hit==hitBalance) {
@@ -930,6 +934,12 @@ void Skin::Activate(View& v,int hit,POINT p) {
     else if(Sliding(hit)) Track(v,hit,p);
 }
 HCURSOR Skin::Cursor(const View& v,POINT p) const {
+    if(const auto edges=ResizeEdges(v,p)) {
+        const bool horizontal=(edges&(TTP_SKIN_DRAG_LEFT|TTP_SKIN_DRAG_RIGHT))!=0;
+        const bool vertical=(edges&(TTP_SKIN_DRAG_TOP|TTP_SKIN_DRAG_BOTTOM))!=0;
+        const bool descending=((edges&TTP_SKIN_DRAG_LEFT)!=0)==((edges&TTP_SKIN_DRAG_TOP)!=0);
+        return LoadCursorW(nullptr,horizontal && vertical?(descending?IDC_SIZENWSE:IDC_SIZENESW):horizontal?IDC_SIZEWE:IDC_SIZENS);
+    }
     const int hit=Hit(v,p);const char* name=nullptr;
     if(v.kind==0) {
         name=v.shaded?"wsnormal":"normal";
@@ -972,10 +982,33 @@ LRESULT CALLBACK Skin::Subclass(HWND window,UINT message,WPARAM wp,LPARAM lp,UIN
     try { return v.skin->Message(v,message,wp,lp); }
     catch(...) { return DefSubclassProc(window,message,wp,lp); }
 }
+uint32_t Skin::ResizeEdges(const View& v,POINT p) const {
+    if(v.kind!=1 && v.kind!=3) return 0;
+    RECT r{};GetClientRect(v.window,&r);
+    if(!PtInRect(&r,p)) return 0;
+    // Keep the title buttons/content intact. Only the narrow outer frame is
+    // a resize target; folded playlists retain their fixed 14-pixel height.
+    constexpr int border=3,corner=6;
+    uint32_t edges=0;
+    if(p.x<border) edges|=TTP_SKIN_DRAG_LEFT;
+    else if(p.x>=r.right-border) edges|=TTP_SKIN_DRAG_RIGHT;
+    if(!v.shaded) {
+        if(p.y<border) edges|=TTP_SKIN_DRAG_TOP;
+        else if(p.y>=r.bottom-border) edges|=TTP_SKIN_DRAG_BOTTOM;
+        if(edges&(TTP_SKIN_DRAG_LEFT|TTP_SKIN_DRAG_RIGHT)) {
+            if(p.y<corner) edges|=TTP_SKIN_DRAG_TOP;
+            else if(p.y>=r.bottom-corner) edges|=TTP_SKIN_DRAG_BOTTOM;
+        } else if(edges) {
+            if(p.x<corner) edges|=TTP_SKIN_DRAG_LEFT;
+            else if(p.x>=r.right-corner) edges|=TTP_SKIN_DRAG_RIGHT;
+        }
+    }
+    return edges;
+}
 bool Skin::HostDrag(View& v,uint32_t phase,POINT point) const {
     if(!host_.drag) return false;
     const TtpSkinDrag event{sizeof(event),phase,v.window,point,
-        static_cast<uint32_t>(v.resizing ? TTP_SKIN_DRAG_RIGHT|(v.shaded?0:TTP_SKIN_DRAG_BOTTOM) : TTP_SKIN_DRAG_WINDOW),
+        v.resizing ? v.resize_edges : uint32_t(TTP_SKIN_DRAG_WINDOW),
         {275,v.shaded?14:116}};
     return host_.drag(host_.context,&event)!=FALSE;
 }
@@ -983,12 +1016,22 @@ void Skin::EndDrag(View& v) {
     // Clear first: the host releases capture synchronously, reentering our
     // WM_CAPTURECHANGED handler before this call returns.
     const bool delegated=std::exchange(v.host_drag,false);
-    v.dragging=v.resizing=false;
+    v.dragging=v.resizing=false;v.resize_edges=0;
     if(delegated) HostDrag(v,TTP_SKIN_DRAG_END);
 }
 LRESULT Skin::Message(View& v,UINT message,WPARAM wp,LPARAM lp) {
+    if(message==WM_PARENTNOTIFY && LOWORD(wp)==WM_CREATE) v.children.Sync(reinterpret_cast<HWND>(lp));
+    // User32 can show a child of a hidden parent without WINDOWPOS messages.
+    // Reconcile it before the parent itself becomes visible.
+    if((message==WM_SHOWWINDOW && wp) || (message==WM_WINDOWPOSCHANGING &&
+        (reinterpret_cast<WINDOWPOS*>(lp)->flags & SWP_SHOWWINDOW))) v.children.Sync();
     if(v.kind==1)SyncPlaylistFont();
-    if(v.kind==3 && host_.content_input &&
+    const POINT raw{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+    POINT cursor=raw;
+    if(message==WM_SETCURSOR) {GetCursorPos(&cursor);ScreenToClient(v.window,&cursor);}
+    const bool frame_input=(message==WM_LBUTTONDOWN || message==WM_LBUTTONDBLCLK || message==WM_MOUSEMOVE || message==WM_SETCURSOR) &&
+        ResizeEdges(v,cursor)!=0 && GetCapture()!=v.window;
+    if(v.kind==3 && host_.content_input && !frame_input &&
        (message==WM_SIZE || (!v.pressed && !v.dragging && !v.resizing))) {
         TtpSkinContent content{sizeof(content),v.window};
         if(ContentState(content,false)) {
@@ -999,7 +1042,6 @@ LRESULT Skin::Message(View& v,UINT message,WPARAM wp,LPARAM lp) {
             }
         }
     }
-    const POINT raw{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
     const int scale=(v.kind==1 || v.kind==3)?1:scale_;
     const POINT point{raw.x/scale,raw.y/scale};
     switch(message) {
@@ -1081,6 +1123,8 @@ LRESULT Skin::Message(View& v,UINT message,WPARAM wp,LPARAM lp) {
         }
         if(v.pressed==hitDrag || v.pressed==hitResize) {
             v.dragging=v.pressed==hitDrag;v.resizing=v.pressed==hitResize;
+            v.resize_edges=ResizeEdges(v,point);
+            if(v.resizing && !v.resize_edges) v.resize_edges=TTP_SKIN_DRAG_RIGHT|(v.shaded?0:TTP_SKIN_DRAG_BOTTOM);
             v.host_drag=HostDrag(v,TTP_SKIN_DRAG_BEGIN,raw);
             // The native begin callback already captures. Capturing twice can
             // synchronously cancel this gesture through WM_CAPTURECHANGED.
@@ -1116,7 +1160,14 @@ LRESULT Skin::Message(View& v,UINT message,WPARAM wp,LPARAM lp) {
                 // Compatibility with older v1 hosts: move this window alone.
                 // Full TTPlayer docking requires the optional host callback.
                 POINT cursor=raw;ClientToScreen(v.window,&cursor);const int dx=cursor.x-v.drag_start.x,dy=cursor.y-v.drag_start.y;
-                if(v.resizing) SetWindowPos(v.window,nullptr,0,0,std::clamp(int(v.drag_rect.right-v.drag_rect.left)+dx,275,2000),(v.shaded?14:std::clamp(int(v.drag_rect.bottom-v.drag_rect.top)+dy,116,1600)),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+                if(v.resizing) {
+                    RECT r=v.drag_rect;
+                    if(v.resize_edges&TTP_SKIN_DRAG_LEFT) r.left=r.right-std::clamp(int(r.right-r.left)-dx,275,2000);
+                    if(v.resize_edges&TTP_SKIN_DRAG_RIGHT) r.right=r.left+std::clamp(int(r.right-r.left)+dx,275,2000);
+                    if(v.resize_edges&TTP_SKIN_DRAG_TOP) r.top=r.bottom-std::clamp(int(r.bottom-r.top)-dy,116,1600);
+                    if(v.resize_edges&TTP_SKIN_DRAG_BOTTOM) r.bottom=r.top+std::clamp(int(r.bottom-r.top)+dy,116,1600);
+                    SetWindowPos(v.window,nullptr,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOZORDER|SWP_NOACTIVATE);
+                }
                 else SetWindowPos(v.window,nullptr,v.drag_rect.left+dx,v.drag_rect.top+dy,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
             } else if(Sliding(v.pressed)) Track(v,v.pressed,point);
             else {v.hot=Hit(v,point)==v.pressed;InvalidateRect(v.window,nullptr,FALSE);}
@@ -1137,14 +1188,17 @@ LRESULT Skin::Message(View& v,UINT message,WPARAM wp,LPARAM lp) {
         }
         if(GetCapture()==v.window && Sliding(hit)) {Track(v,hit,point,true);if(hit==hitSeek && v.seek>=0) Command(TTP_SKIN_SEEK,v.seek);}
         const bool resize=v.resizing && !v.host_drag;
+        const auto edges=v.resize_edges;
         v.pressed=0;v.seek=-1;
         if(hit==hitVolume)EndVolume(host_);
         const bool moving=v.dragging||v.resizing;EndDrag(v);
         if(GetCapture()==v.window) ReleaseCapture();
         if(resize && v.kind==1) {
-            RECT r{};GetClientRect(v.window,&r);
-            SetWindowPos(v.window,nullptr,0,0,275+std::max(0,int(r.right)-275)/25*25,
-                v.shaded?14:116+std::max(0,int(r.bottom)-116)/29*29,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+            RECT r{};GetWindowRect(v.window,&r);
+            const int width=(edges&(TTP_SKIN_DRAG_LEFT|TTP_SKIN_DRAG_RIGHT))?275+std::max(0,int(r.right-r.left)-275)/25*25:r.right-r.left;
+            const int height=v.shaded?14:(edges&(TTP_SKIN_DRAG_TOP|TTP_SKIN_DRAG_BOTTOM))?116+std::max(0,int(r.bottom-r.top)-116)/29*29:r.bottom-r.top;
+            SetWindowPos(v.window,nullptr,(edges&TTP_SKIN_DRAG_LEFT)?r.right-width:r.left,
+                (edges&TTP_SKIN_DRAG_TOP)?r.bottom-height:r.top,width,height,SWP_NOZORDER|SWP_NOACTIVATE);
         }
         if(!moving && !Sliding(hit) && hit==Hit(v,point)) Activate(v,hit,point);
         InvalidateRect(v.window,nullptr,FALSE);return 0;

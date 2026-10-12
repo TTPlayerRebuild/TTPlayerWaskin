@@ -1,4 +1,4 @@
-#include "modern.h"
+﻿#include "modern.h"
 #include "host_interaction.h"
 #include "playlist_interaction.h"
 #include "modern_objects.h"
@@ -82,7 +82,7 @@ struct Modern::Impl {
  int revealRow{-1},wheel{};bool playlistFocus{};
  int sliderQueued{},sliderInitial{},sliderGrab{},sliderCoordinate{};bool profileSliding{};
  PlaylistFontCache playlistFont;std::unique_ptr<Gdiplus::Font> rowFont;int rowHeight{14};LOGFONTW defaultPlaylistFont{};
- std::vector<std::pair<HWND,bool>> children;std::unique_ptr<Gdiplus::Bitmap> frame;
+ NativeChildren children;std::unique_ptr<Gdiplus::Bitmap> frame;
  bool restoreLeft{},restoreRight{},restoreVis{};
  RECT contentRect{},notifiedContent{};
  uint32_t contentMode{TTP_SKIN_CONTENT_LYRICS},contentVisual{1};
@@ -628,30 +628,36 @@ struct Modern::Impl {
  void Slide(Node* n,POINT p,bool final,bool begin=false){
   const auto hit=std::find_if(hits.begin(),hits.end(),[&](const auto& h){return h.node==n;});if(hit==hits.end())return;
   auto* thumb=Bitmap(n->attrs[L"thumb"]);auto r=hit->bounds;const bool vertical=Vertical(n);
-  // Preserve the grab offset for EQ/pan thumbs. A press without movement must
-  // not notify the preset state machine; release sends its final notification.
+  // Preserve the grab offset for EQ/pan/volume thumbs. A press without movement
+  // keeps the accepted value; volume still publishes its immediate feedback.
   const int thumbSize=int(vertical?thumb->GetHeight():thumb->GetWidth());
   const int extent=std::max(1,int(vertical?r.bottom-r.top:r.right-r.left)-thumbSize);
   const auto action=Lower(n->attrs[L"action"]);const bool eq=action==L"eq_band" || action==L"eq_preamp",profile=eq || action==L"pan";
+  const bool volume=action==L"volume",grabbed=profile || volume;
   const int coordinate=vertical?p.y-r.top:p.x-r.left;
-  if(begin && profile) {
-   profileSliding=true;
-   const auto state=State();sliderInitial=sliderQueued=eq?state.eq[EqIndex(n)]:state.balance;
-   n->position=eq?MulDiv(sliderInitial,127,12):std::clamp(MulDiv(sliderInitial,127,100)+127,0,255);
+  if(begin && grabbed) {
+   profileSliding=profile;
+   const auto state=State();sliderInitial=sliderQueued=eq?state.eq[EqIndex(n)]:volume?state.volume:state.balance;
+   n->position=eq?MulDiv(sliderInitial,127,12):volume?MulDiv(sliderInitial,255,100):std::clamp(MulDiv(sliderInitial,127,100)+127,0,255);
    const double fraction=eq?double(n->position+127)/254:double(n->position)/255;
    const int offset=int((vertical?1-fraction:fraction)*extent);
    const bool onThumb=coordinate>=offset && coordinate<offset+thumbSize;
    sliderGrab=onThumb?coordinate-offset:thumbSize/2;sliderCoordinate=coordinate;
-   if(onThumb)return;
+   if(onThumb){if(volume)Command(TTP_SKIN_VOLUME,sliderInitial);return;}
    sliderCoordinate=INT_MIN;
   }
-  if(profile && coordinate==sliderCoordinate) {Slider(n,n->position,final,true);return;}
-  double fraction=double(coordinate-(profile?sliderGrab:thumbSize/2))/extent;if(vertical)fraction=1-fraction;
+  if(grabbed && coordinate==sliderCoordinate) {Slider(n,n->position,final,true);return;}
+  double fraction=double(coordinate-(grabbed?sliderGrab:thumbSize/2))/extent;if(vertical)fraction=1-fraction;
   fraction=std::clamp(fraction,0.0,1.0);
   Slider(n,action==L"seek"?int(fraction*65535):eq?int(std::lround(fraction*254))-127:action.empty()?n->Get(L"low")+int(fraction*(n->Get(L"high",255)-n->Get(L"low"))):int(fraction*255),final,true);
-  if(profile)sliderCoordinate=coordinate;
+  if(grabbed)sliderCoordinate=coordinate;
  }
  LRESULT Message(UINT message,WPARAM wp,LPARAM lp){
+  if(message==WM_PARENTNOTIFY && LOWORD(wp)==WM_CREATE)children.Sync(reinterpret_cast<HWND>(lp));
+    // User32 can show a child of a hidden parent without WINDOWPOS messages.
+    // Reconcile it before the parent itself becomes visible.
+    if((message==WM_SHOWWINDOW && wp) || (message==WM_WINDOWPOSCHANGING &&
+        (reinterpret_cast<WINDOWPOS*>(lp)->flags & SWP_SHOWWINDOW))) children.Sync();
   if(ready && SyncPlaylistFont()){Render();InvalidateRect(window,nullptr,FALSE);}
   POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
   if(message==WM_LBUTTONDOWN || message==WM_RBUTTONDOWN)playlistFocus=PlaylistHit(p);
@@ -663,7 +669,7 @@ struct Modern::Impl {
   case WM_ERASEBKGND:if(wp)Draw(reinterpret_cast<HDC>(wp),WindowFromDC(reinterpret_cast<HDC>(wp))!=window);return 1;
   case WM_PAINT:{PAINTSTRUCT ps{};auto dc=BeginPaint(window,&ps);try{Draw(dc);}catch(...){EndPaint(window,&ps);throw;}EndPaint(window,&ps);return 0;}
   case WM_PRINTCLIENT:Draw(reinterpret_cast<HDC>(wp));return 0;
-  case WM_TIMER:if(wp==modernTimer){if(!fault){Advance(GetTickCount());Render();SyncContent();Region();InvalidateRect(window,nullptr,FALSE);}return 0;}break;
+  case WM_TIMER:if(wp==modernTimer){children.Sync();if(!fault){Advance(GetTickCount());Render();SyncContent();Region();InvalidateRect(window,nullptr,FALSE);}return 0;}break;
   case WM_LBUTTONDOWN:
    SetFocus(window);pressed=HitTest(p);down=p;rowDragging=false;selectionPending=false;profileSliding=false;
    volumeGesture=pressed && Lower(pressed->attrs[L"action"])==L"volume";
@@ -704,6 +710,9 @@ struct Modern::Impl {
   case WM_MOUSEWHEEL:ScreenToClient(window,&p);if(PlaylistHit(p)){PlaylistWheel(wp,wheel,scroll,int(State().track_count),PlaylistPage(playlistRect,rowHeight));InvalidateRect(window,nullptr,FALSE);}
    else VolumeWheel(host,GET_WHEEL_DELTA_WPARAM(wp),State().volume);return 0;
   case WM_KEYDOWN:
+   if(wp==VK_ESCAPE && volumeGesture && pressed && pressed->kind==L"slider" && Lower(pressed->attrs[L"action"])==L"volume") {
+    Command(TTP_SKIN_VOLUME,sliderInitial);SendMessageW(window,WM_CANCELMODE,0,0);return 0;
+   }
    if(wp==VK_ESCAPE && profileSliding && pressed && pressed->kind==L"slider") {
     const auto action=Lower(pressed->attrs[L"action"]);
     if(action==L"pan")Command(TTP_SKIN_BALANCE,sliderInitial);
@@ -732,7 +741,7 @@ struct Modern::Impl {
   Require(IsWindow(w),"invalid player window");window=w;GetWindowRect(w,&saved);savedRegion=CreateRectRgn(0,0,0,0);
   if(GetWindowRgn(w,savedRegion)==ERROR){DeleteObject(savedRegion);savedRegion=nullptr;}
   Require(SetWindowSubclass(w,Subclass,modernId,reinterpret_cast<DWORD_PTR>(this))!=FALSE,"modern subclass");
-  for(HWND child=GetWindow(w,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT)){bool visible=(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;children.emplace_back(child,visible);if(visible)ShowWindow(child,SW_HIDE);}
+  children.Attach(w);
   ready=true;Flush();
   if(restoreLeft && root->Find(L"eqToggle"))Click(root->Find(L"eqToggle"));
   if(restoreRight && root->Find(L"plToggle"))Click(root->Find(L"plToggle"));
@@ -749,12 +758,12 @@ struct Modern::Impl {
    if(GetCapture()==window)ReleaseCapture();
    RemoveWindowSubclass(window,Subclass,modernId);
    if(tooltip)DestroyWindow(tooltip);tooltip=nullptr;
-   for(auto [child,visible]:children)if(visible && IsWindow(child))ShowWindow(child,SW_SHOWNA);
-   SetWindowPos(window,nullptr,0,0,saved.right-saved.left,saved.bottom-saved.top,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);
-   if(SetWindowRgn(window,savedRegion,TRUE))savedRegion=nullptr;
-   InvalidateRect(window,nullptr,TRUE);
+    SetWindowPos(window,nullptr,0,0,saved.right-saved.left,saved.bottom-saved.top,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOREDRAW);
+    if(SetWindowRgn(window,savedRegion,FALSE))savedRegion=nullptr;
+    children.Detach();
+    RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
   }
-  window=nullptr;children.clear();regionRects.clear();
+  children.Detach();window=nullptr;regionRects.clear();
  }
 };
 Modern::Modern(const wchar_t* path,const TtpSkinHost* host):Skin(kBuiltinPackage,host,true),impl_(std::make_unique<Impl>(path,host)){}

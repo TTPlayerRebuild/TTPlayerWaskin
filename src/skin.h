@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "archive.h"
 #include "metadata.h"
 #include "ttp_skin_plugin.h"
@@ -10,6 +10,7 @@
 #include <commctrl.h>
 #include "spectrum.h"
 #include "playlist_font.h"
+#include "native_children.h"
 
 namespace waskin {
 // Keep provider menus, persisted layouts and the host content callback in sync.
@@ -53,13 +54,14 @@ struct View {
     int kind{};
     RECT saved{}, drag_rect{};
     HRGN saved_region{};
-    std::vector<std::pair<HWND,bool>> children;
+    NativeChildren children;
     POINT drag_start{};
     int pressed{}, scroll{}, selected{-1}, wheel{}, grab{}, seek{-1}, initial{};
     int track_value{}, track_coordinate{};
     bool hot{true}, row_drag{}, selection_pending{};
     int drop{-1}, external_drop{-1};
     bool shaded{}, dragging{}, resizing{}, host_drag{};
+    uint32_t resize_edges{};
     int expanded_height{232};
 };
 Image MakeFallback(const char* name,int width,int height);
@@ -155,6 +157,7 @@ private:
     void RefreshRowTip(View& view);
     std::wstring TipText(const View& view,int hit,const RECT& bounds) const;
     bool HostDrag(View& view, uint32_t phase, POINT point = {}) const;
+    uint32_t ResizeEdges(const View& view, POINT point) const;
     void EndDrag(View& view);
     LRESULT Message(View& view,UINT message,WPARAM wp,LPARAM lp);
 };
