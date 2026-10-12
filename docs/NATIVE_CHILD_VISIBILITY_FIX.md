@@ -1,5 +1,28 @@
 # Winamp 皮肤下原版控件露出修复（2026.10.13）
 
+## 补充修复：原版信息定时器直接绘制（2026.10.13p1）
+
+用户再次提供截图后确认：上一轮子控件修复没有覆盖这条路径。截图中的“艺术家”背景条来自宿主主窗口的原版歌曲信息滚动，并不是独立 HWND 控件，因此子控件显示/绘制拦截无法阻止它。
+
+调用链为 `WM_TIMER(7/8/9) → AdvanceSkinInfoScroll → PaintSkinInfoTick → GetDC(window_) → PaintSkin(info)`。原版皮肤对象保留作为辅助窗口的后备布局，但插件接管主窗口后，原版信息定时器仍被启动；它直接将原版矩形、背景和文字画到插件窗口上，绕过了 DLL 的 `WM_PAINT` 处理。
+
+本次修正位于 rebuild：
+
+- 插件模式下不再启动原版信息轮播、过渡和横向滚动定时器。
+- 启动窗口和切换到插件皮肤时立即取消已有的三个信息定时器。
+- 已进入消息队列的旧定时器通知也会停止，不能重新启动过渡动画。
+- `PaintSkinInfoTick` 在插件模式和皮肤切换过程中禁止直接绘制；`PaintSkin` 的局部绘制入口也遵守插件的主窗口绘制权。
+- 切回原版皮肤后恢复原来的信息滚动；插件自己的歌曲标题绘制方式不变。
+
+新增本地 C++ 测试 `rebuild/tests/waskin/info_paint_host_tests.inc`，对真实窗口的 GetDC 绘制结果进行前后像素比较。内置 base-2.91 的旧宿主通过过渡定时器覆盖了 2,420 个像素；修复后三个定时器、直接绘制及局部绘制均为 0 像素覆盖。HeadAMP WAL 也通过局部绘制和定时器检查。XP、Win7 两台虚拟机均通过这两种皮肤的回归，包括三轮原版/插件切换和原版滚动恢复。
+
+证据保存在 `rebuild/out/test-artifacts/native-info-paint-20261013p1/`：`old-base`、`fixed-base` 为实际窗口截图与日志，`vm-results.json` 为虚拟机结果。测试继续仅保留在本地，发布包不含测试，Actions 未更改。
+
+本次必须更新主程序至 `2026.10.13p1`；`ttp_waskin.dll` 可以继续使用上一轮的 `2026.10.13` 版本。
+
+以下为上一轮子控件修复的记录。
+
+
 ## 原因
 
 这是宿主和插件之间的窗口显示管理问题。插件接管已有 HWND 绘制皮肤，原版的列表、按钮、歌词和视觉控件仍保留在这些 HWND 内。
@@ -42,7 +65,7 @@ XP 和 Win7 虚拟机均通过 WSZ、HeadAMP WAL 下的上述回归，以及歌�
 
 ## 更新文件
 
-- 宿主更新包：`rebuild/build/Release/TTPlayerRebuild-2026.10.13.zip`
+- 宿主更新包：`rebuild/build/Release/TTPlayerRebuild-2026.10.13p1.zip`
 - 插件：`rebuild/build/Release/AddIn/ttp_waskin.dll`
 
-更新时同时替换宿主和插件。MAKI DLL 无需更改。
+主程序更新至 2026.10.13p1，插件沿用 2026.10.13。MAKI DLL 无需更改。
