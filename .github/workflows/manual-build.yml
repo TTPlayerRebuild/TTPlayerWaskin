@@ -4,6 +4,11 @@ run-name: Waskin x86 ${{ inputs.release_a_version && 'Release' || 'Build' }} - $
 on:
   workflow_dispatch:
     inputs:
+      only_if_unreleased:
+        description: Skip build/release when this commit is already released
+        type: boolean
+        required: false
+        default: false
       release_a_version:
         description: Release a Version
         type: boolean
@@ -20,7 +25,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release_check:
+    name: Check for unpublished commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check release commit inside the publication concurrency group
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONLY_IF_UNRELEASED: ${{ inputs.only_if_unreleased }}
+          RELEASE_REQUESTED: ${{ inputs.release_a_version }}
+        run: python3 cmake/check_component_release.py
+
   build:
+    needs: release_check
+    if: needs.release_check.outputs.should_build == 'true'
     name: Build DLL (VS 2026, Windows x86)
     runs-on: windows-2025-vs2026
     timeout-minutes: 30
@@ -33,7 +58,7 @@ jobs:
       dll_sha256: ${{ steps.package.outputs.dll_sha256 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -95,7 +120,7 @@ jobs:
       # Downloading this artifact produces a ZIP with AddIn/ and SHA256SUMS.txt
       # at its root, without a second ZIP or a containing package/ directory.
       - name: Upload plugin
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@v7
         with:
           name: ttp_waskin-${{ steps.version.outputs.version }}
           path: build/package/
@@ -104,7 +129,7 @@ jobs:
 
       - name: Upload configure diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@v7
         with:
           name: waskin-configure-log-${{ github.run_number }}
           path: build/CMakeFiles/CMakeConfigureLog.yaml
@@ -128,7 +153,7 @@ jobs:
       DLL_SHA256: ${{ needs.build.outputs.dll_sha256 }}
     steps:
       - name: Download plugin
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@v8
         with:
           name: ttp_waskin-${{ needs.build.outputs.version }}
           path: package
