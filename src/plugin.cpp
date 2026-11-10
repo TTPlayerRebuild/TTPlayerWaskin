@@ -107,7 +107,7 @@ BOOL WINAPI PlaylistViewport(void* instance,HWND window,uint32_t* first,uint32_t
     try {return instance && first && count && static_cast<waskin::Skin*>(instance)->PlaylistViewport(window,*first,*count);} catch(...) {return FALSE;}
 }
 HRESULT WINAPI Layout(void* instance,TtpSkinLayout* state,BOOL restore) {
-    if(!instance || !state || state->size<sizeof(*state)) return E_INVALIDARG;
+    if(!instance || !state || state->size<TTP_SKIN_LAYOUT_V1_SIZE) return E_INVALIDARG;
     try {return static_cast<waskin::Skin*>(instance)->Layout(*state,restore!=FALSE);} catch(...) {return E_FAIL;}
 }
 }

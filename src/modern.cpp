@@ -815,7 +815,9 @@ HRESULT Modern::Layout(TtpSkinLayout& state,bool restore){
    if(version>=3 && (!(input>>contentMode>>contentVisual) || contentMode<1 || contentMode>3 || contentVisual>=visualEffectNames.size()))return E_INVALIDARG;
    input>>std::ws;if(!input.eof())return E_INVALIDARG;
   }
-  auto fallback=state;wcscpy_s(fallback.state,text.empty()?L"":text.substr(separator+1).c_str());
+  TtpSkinLayout fallback{};
+  memcpy(&fallback,&state,std::min<size_t>(state.size,sizeof(fallback)));
+  wcscpy_s(fallback.state,text.empty()?L"":text.substr(separator+1).c_str());
   auto result=Skin::Layout(fallback,true);if(FAILED(result))return result;
   if(!layoutId.empty())impl_->SwitchLayout(layoutId);
   impl_->contentMode=contentMode;impl_->contentVisual=contentVisual;
@@ -825,7 +827,21 @@ HRESULT Modern::Layout(TtpSkinLayout& state,bool restore){
  std::wstring tail=state.state;auto* left=impl_->root->Find(L"LeftDrawerStatus");auto* right=impl_->root->Find(L"RightDrawerStatus");auto* vis=impl_->root->Find(L"vis");
  std::wostringstream payload;payload<<3<<L' '<<(left?left->Get(L"x"):0)<<L' '<<(right?right->Get(L"x"):0)<<L' '<<(vis && vis->visible?1:0)<<L' '<<impl_->scroll<<L' '<<std::quoted(impl_->layout->Id())<<L' '<<impl_->contentMode<<L' '<<impl_->contentVisual<<L'|'<<tail;
  if(payload.str().size()>=std::size(state.state))return E_FAIL;wcscpy_s(state.state,payload.str().c_str());
- if(impl_->window)GetWindowRect(impl_->window,&state.windows[0]);else state.windows[0]=impl_->restored;return S_OK;
+ if(impl_->window) {
+  if(IsIconic(impl_->window)) {
+   WINDOWPLACEMENT placement{sizeof(placement)};
+   state.windows[0]=impl_->saved;
+   if(GetWindowPlacement(impl_->window,&placement)) {
+    state.windows[0]=placement.rcNormalPosition;
+    if(!(GetWindowLongPtrW(impl_->window,GWL_EXSTYLE)&WS_EX_TOOLWINDOW)) {
+     MONITORINFO monitor{sizeof(monitor)};
+     if(GetMonitorInfoW(MonitorFromWindow(impl_->window,MONITOR_DEFAULTTONEAREST),&monitor))
+      OffsetRect(&state.windows[0],monitor.rcWork.left-monitor.rcMonitor.left,monitor.rcWork.top-monitor.rcMonitor.top);
+    }
+   }
+  } else GetWindowRect(impl_->window,&state.windows[0]);
+ } else state.windows[0]=impl_->restored;
+ return S_OK;
 }
 bool Modern::ContentState(TtpSkinContent& state,bool apply){
  if(state.window!=impl_->window)return Skin::ContentState(state,apply);
@@ -844,7 +860,7 @@ HMENU Modern::Menu(HWND window,uint32_t command){
   TtpSkinContent c{sizeof(c),window};if(!ContentState(c,false))return nullptr;
   if(command>=700 && command<703)c.mode=command-699;
   else if(command>=710 && command<710+visualEffectNames.size())c.visual_type=command-710;
-  else if(command==720)impl_->Command(TTP_SKIN_CONTENT_FULLSCREEN,c.mode|(c.visual_type<<8));
+  else if(command==720)impl_->Command(TTP_SKIN_CONTENT_FULLSCREEN,c.mode|(c.visual_type<<8)|TTP_SKIN_FULLSCREEN_MAIN_WINDOW);
   ContentState(c,true);return nullptr;
  }
  HMENU menu=CreatePopupMenu(),effects=CreatePopupMenu();
@@ -894,6 +910,13 @@ bool Modern::VolumeTracking()const{
 }
 bool Modern::PlaylistReveal(uint32_t row,int32_t caret){
  const bool classic=Skin::PlaylistReveal(row,caret);
+ if(row==UINT32_MAX) {
+  if(impl_->window)SendMessageW(impl_->window,WM_CANCELMODE,0,0);
+  impl_->selected=impl_->revealRow=impl_->drop=-1;impl_->scroll=impl_->wheel=0;
+  impl_->rowDragging=impl_->selectionPending=false;impl_->Tip({-1,-1});
+  if(impl_->window){impl_->Render();InvalidateRect(impl_->window,nullptr,FALSE);}
+  return true;
+ }
  if(row>=impl_->State().track_count || row>INT_MAX)return classic;
  impl_->selected=caret;impl_->revealRow=int(row);
  if(impl_->window)InvalidateRect(impl_->window,nullptr,FALSE);

@@ -19,6 +19,7 @@ HRESULT Skin::Layout(TtpSkinLayout& state,bool restore) {
     if(!restore) {
         CaptureLayout();
         for(size_t i=0;i<3;++i) state.windows[i]=layout_.bounds[i];
+        if(state.size>=sizeof(state)) state.lyric_window=layout_.bounds[3];
         const auto& video=layout_.bounds[3];
         swprintf_s(state.state,L"2 %d %d %d %d %d %d %d %d %ld %ld %ld %ld %d %d",layout_.scale,
             int(layout_.shaded[0]),int(layout_.shaded[1]),int(layout_.shaded[2]),
@@ -70,13 +71,32 @@ HRESULT Skin::Layout(TtpSkinLayout& state,bool restore) {
             if(i==1 && !next.shaded[i] && height>=116 && height<=32767) next.expanded[i]=int(height);
         }
     }
+    // The explicit rectangles are authoritative. A root XML saved after an
+    // older sidecar may contain a new scale, fold state or playlist height.
+    const auto& main=state.windows[0];
+    const auto main_width=int64_t(main.right)-main.left;
+    if(!fallback_only_ && (main_width==275 || main_width==550)) {
+        next.scale=static_cast<int>(main_width/275);
+        next.expanded[0]=next.expanded[2]=116*next.scale;
+    }
     for(size_t i=0;i<3;++i) {
         const auto& r=state.windows[i];
         const int64_t width=int64_t(r.right)-r.left,height=int64_t(r.bottom)-r.top;
         if(width<=0 || height<=0 || r.left < -1000000 || r.left>1000000 || r.top < -1000000 || r.top>1000000) continue;
+        next.shaded[i]=height==14*(i==1?1:next.scale);
+        if(i==1 && !next.shaded[i]) next.expanded[i]=static_cast<int>(std::clamp<int64_t>(height,116,32767));
         const int restored_width=i==1?int(std::clamp<int64_t>(width,275,32767)):275*next.scale;
         const int restored_height=next.shaded[i]?14*(i==1?1:next.scale):next.expanded[i];
         next.bounds[i]={r.left,r.top,r.left+restored_width,r.top+restored_height};
+    }
+    if(state.size>=sizeof(state) && !IsRectEmpty(&state.lyric_window)) {
+        const auto& r=state.lyric_window;
+        const int64_t width=int64_t(r.right)-r.left,height=int64_t(r.bottom)-r.top;
+        if(r.left>=-1000000 && r.left<=1000000 && r.top>=-1000000 && r.top<=1000000) {
+            next.bounds[3]={r.left,r.top,r.left+static_cast<LONG>(std::clamp<int64_t>(width,275,32767)),
+                r.top+static_cast<LONG>(std::clamp<int64_t>(height,116,32767))};
+            next.expanded[3]=next.bounds[3].bottom-next.bounds[3].top;
+        }
     }
     layout_=next;return S_OK;
 }

@@ -641,7 +641,14 @@ bool Skin::VolumeTracking() const {
 }
 bool Skin::PlaylistReveal(uint32_t row,int32_t caret) {
     SyncPlaylistFont();
-    auto& v=views_[1];if(!v.window || row>INT_MAX || row>=State().track_count)return false;
+    auto& v=views_[1];if(!v.window)return false;
+    if(row==UINT32_MAX) {
+        SendMessageW(v.window,WM_CANCELMODE,0,0);
+        v.selected=-1;v.scroll=v.wheel=0;v.drop=v.external_drop=-1;
+        v.row_drag=v.selection_pending=false;HideTip(v);
+        InvalidateRect(v.window,nullptr,FALSE);return true;
+    }
+    if(row>INT_MAX || row>=State().track_count)return false;
     RECT bounds{};GetClientRect(v.window,&bounds);
     const int rows=std::max(1,((v.shaded?v.expanded_height:int(bounds.bottom))-60)/row_height_);
     v.selected=caret;
